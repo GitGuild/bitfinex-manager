@@ -1,0 +1,4 @@
+# database
+sqlalchemy>=1.0.9
+
+trade_manager >= 0.0.1

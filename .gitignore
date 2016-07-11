@@ -1,0 +1,15 @@
+# temporary and build files
+cfg.py
+cfg.ini
+*.log
+*.pyc
+*~
+.cache
+.eggs
+*.egg-info
+dist
+build
+
+.openshift
+
+
