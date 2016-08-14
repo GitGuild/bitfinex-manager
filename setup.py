@@ -19,7 +19,9 @@ setup(
     setup_requires=['pytest-runner'],
     install_requires=[
         'sqlalchemy>=1.0.9',
-        'trade_manager>=0.0.1'
+        'trade_manager>=0.0.3',
+        'tapp-config>=0.0.2',
+        'tappmq', 'requests',
     ],
     tests_require=['pytest', 'pytest-cov']
 )

@@ -11,25 +11,18 @@ from base64 import b64encode
 from hashlib import sha384
 from ledger import Amount, Balance
 from requests.exceptions import Timeout, ConnectionError
-from trade_manager import CFG, em, wm, ExchangeError, make_ledger
-from trade_manager.plugin import InternalExchangePlugin
+from sqlalchemy import update
+from sqlalchemy_models import jsonify2
+from trade_manager import em, wm
+from trade_manager.plugin import ExchangePluginBase, get_order_by_order_id, submit_order, get_orders
 
 NAME = 'bitfinex'
-KEY = CFG.get('bitfinex', 'key')
 
-BASE_URL = 'https://api.bitfinex.com'
+BASE_URL = "https://api.bitfinex.com"
 REQ_TIMEOUT = 10  # seconds
 
 
-def unadjust_currency(c):
-    if len(c) > 3 and c[0] in "XZ":
-        c = c[1:]
-    if c == "XBT":
-        c = "BTC"
-    return c
-
-
-class Bitfinex(InternalExchangePlugin):
+class Bitfinex(ExchangePluginBase):
     NAME = 'bitfinex'
     _user = None
 
@@ -44,289 +37,317 @@ class Bitfinex(InternalExchangePlugin):
         }
 
     def bitfinex_request(self, endpoint, params=None):
+        if "/v1/" not in endpoint:
+            endpoint = "/v1/%s" % endpoint
         params = params or {}
         params['request'] = endpoint
+        headers = self.bitfinex_encode(params)
         response = None
-        while response is None:
-            try:
-                response = requests.post(url=BASE_URL + params['request'],
-                                         headers=self.bitfinex_encode(params),
-                                         timeout=REQ_TIMEOUT)
-                if "Nonce is too small." in response:
-                    response = None
-            except (ConnectionError, Timeout) as e:
-                raise ExchangeError('bitfinex', '%s %s while sending to bitfinex %r' % (type(e), str(e), params))
+        try:
+            response = requests.post(url=BASE_URL + params['request'],
+                                     headers=headers,
+                                     timeout=REQ_TIMEOUT)
+            if "Nonce is too small." in response:
+                response = None
+        except (ConnectionError, Timeout) as e:
+            self.logger.exception(
+                '%s %s while sending %r to bitfinex %s, response %s' % (type(e), e, params, endpoint, response))
+            return
         return response
 
     @classmethod
-    def format_pair(cls, pair):
+    def format_market(cls, market):
         """
+        The default market symbol is an uppercase string consisting of the base commodity
+        on the left and the quote commodity on the right, separated by an underscore.
+
+        If the data provided by the exchange does not match the default
+        implementation, then this method must be re-implemented.
+
+        Bitfinex uses the following.
+
         formatted : unformatted
         'BTC_USD': 'btcusd'
         'LTC_USD': 'ltcusd'
         'LTC_BTC': 'ltcbtc'
         'ETH_USD': 'ethusd'
         'ETH_BTC': 'ethbtc'
+        'DASH_USD': 'drkusd'
+
+        :return: a market formated according to what bitcoin_exchanges expects.
         """
-        if pair[0] == 'l':
-            base = 'LTC'
-            if pair[2:] == 'btc':
-                quote = 'BTC'
-            else:
-                quote = 'USD'
-        elif pair[0] == 'e':
-            base = 'ETH'
-            if pair[2:] == 'btc':
-                quote = 'BTC'
-            else:
-                quote = 'USD'
-        elif pair[0] == 'b':
-            base = 'BTC'
-            quote = 'USD'
+        base = market[:3].upper().replace('DRK', 'DASH')
+        quote = market[3:].upper().replace('DRK', 'DASH')
         return base + '_' + quote
 
     @classmethod
-    def unformat_pair(cls, pair):
+    def unformat_market(cls, market):
+        """
+        Reverse format a market to the format recognized by the exchange.
+        If the data provided by the exchange does not match the default
+        implementation, then this method must be re-implemented.
+
+        :return: a market formated according to what bitfinex expects.
+        """
         try:
-            base, quote = pair.lower().split("_")
+            base, quote = market.lower().split("_")
         except ValueError:
-            base = pair[:3].lower()
-            quote = pair[4:].lower()
-        base = base.replace('dash', 'drk')
+            base = market[:3].lower().replace('dash', 'drk')
+            quote = market[3:].lower().replace('dash', 'drk')
         return "%s%s" % (base, quote)
 
-    def base_currency(self, pair):
-        bcurr = pair[:3]
-        return bcurr
+    @classmethod
+    def format_commodity(cls, c):
+        """
+        The default commodity symbol is an uppercase string of 3 or 4 letters.
 
-    def quote_currency(self, pair):
-        qcurr = pair[4:]
-        return qcurr
-
-    def cancel_order(self, order_id, pair=None):
-        params = {'order_id': int(order_id)}
-        try:
-            resp = self.bitfinex_request('/v1/order/cancel', params).json()
-        except ValueError as e:
-            raise ExchangeError('bitfinex', '%s %s while sending to bitfinex %r' % (type(e), str(e), params))
-        if resp and 'id' in resp and resp['id'] == params['order_id']:
-            return True
-        elif 'message' in resp and resp['message'] == 'Order could not be cancelled.':
-            return True
-        else:
-            return False
-
-    def cancel_orders(self, pair=None, **kwargs):
-        resp = self.bitfinex_request('/v1/order/cancel/all')
-        # example respose:
-        # {"result":"4 orders successfully cancelled"}
-        if "orders successfully cancelled" in resp.text:
-            return True
-        else:
-            return False
-
-    def create_order(self, amount, price, otype, pair, typ='exchange limit', bfxexch='all'):
-        if CFG.get('bitfinex', 'BLOCK_ORDERS'):
-            return "order blocked"
-        if otype == 'bid':
-            otype = 'buy'
-        elif otype == 'ask':
-            otype = 'sell'
-        else:
-            raise Exception('unknown side %r' % otype)
-        exch_pair = self.unformat_pair(pair)
-        params = {
-            'side': otype,
-            'symbol': exch_pair,
-            'amount': "{:0.4f}".format(amount),
-            'price': "{:0.4f}".format(price),
-            'exchange': bfxexch,
-            'type': typ
-        }
-        try:
-            order = self.bitfinex_request('/v1/order/new', params).json()
-        except ValueError as e:
-            raise ExchangeError('bitfinex', '%s %s while sending to bitfinex %r' % (type(e), str(e), params))
-
-        if 'is_live' in order and order['is_live']:
-            return str(order['order_id'])
-        raise ExchangeError('bitfinex', 'unable to create order %r response was %r' % (params, order))
+        If the data provided by the exchange does not match the default
+        implementation, then this method must be re-implemented.
+        """
+        return c.upper().replace('DRK', 'DASH')
 
     @classmethod
-    def format_book_item(cls, item):
-        return super(Bitfinex, cls).format_book_item((item['price'], item['amount']))
+    def unformat_commodity(cls, c):
+        """
+        Reverse format a commodity to the format recognized by the exchange.
+        If the data provided by the exchange does not match the default
+        implementation, then this method must be re-implemented.
+        """
+        return c.lower().replace('dash', 'drk')
 
     @classmethod
-    def unformat_book_item(cls, item):
-        return {'price': str(item[0]), 'amount': str(item[1])}
+    def sync_book(cls, market=None):
+        exch_pair = cls.unformat_market(market)
+        return requests.get('%s/v1/book/%s' % (BASE_URL, exch_pair), timeout=REQ_TIMEOUT).json()
 
-    def get_balance(self, btype='total'):
-        try:
-            data = self.bitfinex_request('/v1/balances').json()
-        except ValueError as e:
-            raise ExchangeError('bitfinex', '%s %s while sending to bitfinex get_balance' % (type(e), str(e)))
-        if 'message' in data:
-            raise ExchangeError(exchange='bitfinex', message=data['message'])
-        relevant = filter(lambda x: x['currency'].upper() in self.active_currencies, data)
-
-        if btype == 'total':
-            total = Balance(*map(lambda x: Amount("%s %s" % (x['amount'], x['currency'].upper())), relevant))
-            return total
-        elif btype == 'available':
-            available = Balance(*map(lambda x: Amount("%s %s" % (x['available'], x['currency'].upper())), relevant))
-            return available
-        else:
-            total = Balance(*map(lambda x: Amount("%s %s" % (x['amount'], x['currency'].upper())), relevant))
-            available = Balance(*map(lambda x: Amount("%s %s" % (x['available'], x['currency'].upper())), relevant))
-            return total, available
-
-    def get_open_orders(self, pair):
-        exch_pair = self.unformat_pair(pair)
-        try:
-            rawos = self.bitfinex_request('/v1/orders').json()
-        except ValueError as e:
-            raise ExchangeError('bitfinex', '%s %s while sending to bitfinex get_open_orders' % (type(e), str(e)))
-        orders = []
-        for o in rawos:
-            if o['symbol'] == exch_pair:
-                side = 'ask' if o['side'] == 'sell' else 'bid'
-                orders.append(em.Order(Amount("%s %s" % (o['price'], self.quote_currency(pair))),
-                                       Amount("%s %s" % (o['remaining_amount'], self.base_currency(pair))), side,
-                                       self.NAME, str(o['id'])))
-            else:
-                pass
-        return orders
-
-    @classmethod
-    def get_order_book(cls, pair=None, **kwargs):
-        exch_pair = cls.unformat_pair(pair)
-        try:
-            return requests.get('%s/v1/book/%s' % (BASE_URL, exch_pair),
-                                timeout=REQ_TIMEOUT).json()
-        except ValueError as e:
-            raise ExchangeError('bitfinex', '%s %s while sending to bitfinex get_order_book' % (type(e), str(e)))
-
-    @classmethod
-    def get_ticker(cls, pair=None):
-        exch_pair = cls.unformat_pair(pair)
+    def sync_ticker(self, market='BTC_USD'):
+        exch_pair = self.unformat_market(market)
         try:
             rawtick = requests.get(BASE_URL + '/v1/pubticker/%s' % exch_pair, timeout=REQ_TIMEOUT).json()
         except (ConnectionError, Timeout, ValueError) as e:
-            raise ExchangeError('bitfinex', '%s %s while sending get_ticker to bitfinex' % (type(e), str(e)))
+            self.logger.exception(e)
+            return
 
-        return create_ticker(bid=rawtick['bid'], ask=rawtick['ask'], high=rawtick['high'], low=rawtick['low'],
-                             volume=rawtick['volume'], last=rawtick['last_price'], timestamp=rawtick['timestamp'],
-                             currency=cls.quote_currency(pair), vcurrency=cls.base_currency(pair))
+        tick = em.Ticker(float(rawtick['bid']),
+                         float(rawtick['ask']),
+                         float(rawtick['high']),
+                         float(rawtick['low']),
+                         float(rawtick['volume']),
+                         float(rawtick['last_price']),
+                         market, 'bitfinex')
 
-    def get_trades_history(self, begin=None, end=None, pair='BTC_USD', limit=50):
-        exch_pair = self.unformat_pair(pair)
-        params = {'symbol': exch_pair.replace("/_", ""), 'limit_trades': limit, 'reverse': 1}
-        if begin == 'last':
-            last = self.session.query(em.Trade)\
-                        .filter(em.Trade.exchange=='bitfinex') \
-                        .filter(em.Trade.market == pair) \
-                        .order_by(em.Trade.time.desc())\
-                        .first()
-            if last:
-                params['timestamp'] = str(time.mktime(last.time.timetuple()))
-        elif begin is not None:
+        self.logger.debug("bitfinex %s tick %s" % (market, tick))
+        jtick = jsonify2(tick, 'Ticker')
+        self.logger.debug("bitfinex %s json ticker %s" % (market, jtick))
+        self.red.set('bitfinex_%s_ticker' % market, jtick)
+        return tick
+
+    def sync_balances(self):
+        try:
+            data = self.bitfinex_request('balances').json()
+        except ValueError as e:
+            self.logger.exception('%s %s while sending to bitfinex get_balance' % (type(e), str(e)))
+        if 'message' in data:
+            self.logger.exception('%s while sending to bitfinex get_balance' % data['message'])
+        self.logger.debug('balances data %s' % data)
+        self.logger.debug('self.active_currencies %s' % self.active_currencies)
+        total = Balance()
+        available = Balance()
+        for bal in data:
+            comm = self.format_commodity(bal['currency'])
+            total = total + Amount("%s %s" % (bal['amount'], comm))
+            available = available + Amount("%s %s" % (bal['available'], comm))
+        self.logger.debug("total balance: %s" % total)
+        self.logger.debug("available balance: %s" % available)
+        bals = {}
+        for amount in total:
+            comm = str(amount.commodity)
+            bals[comm] = self.session.query(wm.Balance).filter(wm.Balance.user_id == self.manager_user.id) \
+                .filter(wm.Balance.currency == comm).one_or_none()
+            if not bals[comm]:
+                bals[comm] = wm.Balance(amount, available.commodity_amount(amount.commodity), comm, "",
+                                        self.manager_user.id)
+                self.session.add(bals[comm])
+            else:
+                bals[comm].load_commodities()
+                bals[comm].total = amount
+                bals[comm].available = available.commodity_amount(amount.commodity)
+        try:
+            self.session.commit()
+        except Exception as e:
+            self.logger.exception(e)
+            self.session.rollback()
+            self.session.flush()
+
+    def sync_orders(self):
+        oorders = self.get_open_orders()
+        dboorders = get_orders(exchange='bitfinex', state='open', session=self.session)
+        for dbo in dboorders:
+            if dbo not in oorders:
+                dbo.state = 'closed'
+        self.session.commit()
+
+    def cancel_order(self, oid=None, order_id=None, order=None):
+        if order is None and oid is not None:
+            order = self.session.query(em.LimitOrder).filter(em.LimitOrder.id == oid).first()
+        elif order is None and order_id is not None:
+            order = self.session.query(em.LimitOrder).filter(em.LimitOrder.order_id == order_id).first()
+        elif order is None:
+            return
+        params = {'order_id': int(order.order_id.split("|")[1])}
+        resp = self.bitfinex_request('order/cancel', params).json()
+        if resp and 'id' in resp and resp['id'] == params['order_id']:
+            order.state = 'closed'
+            order.order_id = order.order_id.replace('tmp', 'bitfinex')
+            try:
+                self.session.commit()
+            except Exception as e:
+                self.logger.exception(e)
+                self.session.rollback()
+                self.session.flush()
+
+    def cancel_orders(self, market=None, side=None, oid=None, order_id=None):
+        if market is None and side is None and oid is None and order_id is None:
+            resp = self.bitfinex_request('order/cancel/all')
+            if "orders successfully cancelled" in resp.text:
+                # self.session.query(em.LimitOrder).filter(em.LimitOrder.exchange == 'bitfinex').update()
+                update(em.LimitOrder).where(em.LimitOrder.exchange == 'bitfinex').values(state='closed')
+        elif oid is not None or order_id is not None:
+            order = self.session.query(em.LimitOrder)
+            if oid is not None:
+                order = order.filter(em.LimitOrder.id == oid).first()
+            elif order_id is not None:
+                order_id = order_id if "|" not in order_id else "bitfinex|%s" % order_id.split("|")[1]
+                order = get_order_by_order_id(order_id, 'bitfinex', session=self.session)
+            self.cancel_order(order=order)
+        else:
+            orders = self.get_open_orders(market=market)
+            for o in orders:
+                if market is not None and market != o.market:
+                    continue
+                if side is not None and side != o.side:
+                    continue
+                self.cancel_order(order=o)
+
+    def create_order(self, oid, expire=None):
+        order = self.session.query(em.LimitOrder).filter(em.LimitOrder.id == oid).first()
+        if not order:
+            self.logger.warning("unable to find order %s" % oid)
+            if expire is not None and expire < time.time():
+                submit_order('bitfinex', oid, expire=expire)  # back of the line!
+            return
+        market = self.unformat_market(order.market)
+        amount = "{:0.5f}".format(order.amount.to_double()) if isinstance(order.amount, Amount) else float(order.amount)
+        price = "{:0.5f}".format(order.price.to_double()) if isinstance(order.price, Amount) else float(order.price)
+        side = 'buy' if order.side == 'bid' else 'sell'
+        exch_pair = self.unformat_market(market)
+        params = {
+            'side': side,
+            'symbol': exch_pair,
+            'amount': amount,
+            'price': price,
+            'exchange': 'all',
+            'type': 'exchange limit'
+        }
+        try:
+            resp = self.bitfinex_request('order/new', params).json()
+        except ValueError as e:
+            self.logger.exception(e)
+        if 'is_live' not in resp or not resp['is_live']:
+            self.logger.warning("create order failed w/ %s" % resp)
+            # Do nothing. The order can stay locally "pending" and be retried, if desired.
+        else:
+            order.order_id = 'bitfinex|%s' % resp['order_id']
+            order.state = 'open'
+            self.logger.debug("submitted order %s" % order)
+            try:
+                self.session.commit()
+            except Exception as e:
+                self.logger.exception(e)
+                self.session.rollback()
+                self.session.flush()
+            return order
+
+    def get_open_orders(self, market=None):
+        try:
+            rawos = self.bitfinex_request('orders').json()
+        except ValueError as e:
+            self.logger.exception(e)
+        orders = []
+        for o in rawos:
+            if market is None or o['symbol'] == self.unformat_market(market):
+                side = 'ask' if o['side'] == 'sell' else 'bid'
+                # orders.append(em.LimitOrder(Amount("%s %s" % (o['price'], self.quote_commodity(market))),
+                #                        Amount("%s %s" % (o['remaining_amount'], self.base_commodity(market))), side,
+                #                        self.NAME, str(o['id'])))
+                pair = self.format_market(o['symbol'])
+                base = self.base_commodity(pair)
+                amount = Amount("%s %s" % (o['remaining_amount'], base))
+                exec_amount = Amount("%s %s" % (o['executed_amount'], base))
+                quote = self.quote_commodity(pair)
+                lo = None
+                try:
+                    lo = get_order_by_order_id(str(o['id']), 'bitfinex', session=self.session)
+                except Exception as e:
+                    self.logger.exception(e)
+                if lo is None:
+                    lo = em.LimitOrder(Amount("%s %s" % (o['price'], quote)), amount, pair, side,
+                                       self.NAME, str(o['id']), exec_amount=exec_amount, state='open')
+                    self.session.add(lo)
+                else:
+                    lo.state = 'open'
+                orders.append(lo)
+        try:
+            self.session.commit()
+        except Exception as e:
+            self.logger.exception(e)
+            self.session.rollback()
+            self.session.flush()
+        return orders
+
+    def get_trades_history(self, begin=None, end=None, market='BTC_USD', limit=500):
+        exch_pair = self.unformat_market(market)
+        params = {'symbol': exch_pair, 'limit_trades': limit}
+        if begin is not None:
             params['timestamp'] = str(begin)
         if end is not None:
             params['until'] = str(end)
         try:
-            return self.bitfinex_request('/v1/mytrades', params).json()
+            return self.bitfinex_request('mytrades', params).json()
         except ValueError as e:
-            raise ExchangeError('bitfinex', '%s %s while sending to bitfinex get_trades_history' % (type(e), str(e)))
+            self.logger.exception(e)
 
-    def get_dw_history(self, currency, begin, end):
+    def get_dw_history(self, currency, begin=None, end=None):
         params = {'currency': currency.replace("DASH", "DRK")}
-        if begin == 'last':
-            last = self.session.query(em.Trade)\
-                        .filter(em.Trade.exchange=='bitfinex')\
-                        .order_by(em.Trade.time.desc())\
-                        .first()
-            if last:
-                params['since'] = str(time.mktime(last.time.timetuple()))
-        elif begin is not None:
+        if begin is not None:
             params['since'] = str(begin)
         if end is not None:
             params['until'] = str(end)
         try:
-            return self.bitfinex_request('/v1/history/movements', params).json()
+            return self.bitfinex_request('history/movements', params).json()
         except ValueError as e:
-            raise ExchangeError('bitfinex', '%s %s while sending to bitfinex get_dw_history' % (type(e), str(e)))
+            self.logger.exception(e)
 
-    def get_active_positions(self):
-        try:
-            return self.bitfinex_request('/v1/positions').json()
-        except ValueError as e:
-            raise ExchangeError('bitfinex', '%s %s while sending to bitfinex get_active_positions' % (type(e), str(e)))
-
-    def get_order_status(self, order_id):
-        params = {'order_id': int(order_id)}
-        try:
-            return self.bitfinex_request('/v1/order/status', params).json()
-        except ValueError as e:
-            raise ExchangeError('bitfinex', '%s %s while sending to bitfinex get_order_status for %s' % (
-                type(e), str(e), str(order_id)))
-
-    def get_deposit_address(self):
-        """
-        # TODO implement for multicurrency
-
-        request parmas
-        Key         Type      Description
-        method	    [string]  Method of deposit (accepted:
-                                  'bitcoin', 'litecoin', 'ethereum'.)
-        wallet_name [string]  Your wallet needs to already exist.
-                              Wallet to deposit in (accepted:
-                                  'trading', 'exchange', 'deposit')
-        renew	    [integer] (optional) Default is 0.
-                              If set to 1, will return a new unused deposit address
-
-        response
-        result	    [string]   'success' or 'error
-        method	    [string]
-        currency    [string]
-        address	    [string]	The deposit address (or error message if result = 'error')
-        """
-        try:
-            result = self.bitfinex_request('/v1/deposit/new', {'currency': 'BTC', 'method': 'bitcoin',
-                                                               'wallet_name': 'exchange'}).json()
-            if result['result'] == 'success' and 'address' in result:
-                return str(result['address'])
-            else:
-                raise ExchangeError('bitfinex', result)
-        except ValueError as e:
-            raise ExchangeError('bitfinex', '%s %s while sending get_deposit_address' % (type(e), str(e)))
-
-    def account_info(self):
-        try:
-            data = self.bitfinex_request('/v1/account_infos').json()
-        except ValueError as e:
-            raise ExchangeError('bitfinex', '%s %s while sending to bitfinex get_open_orders' % (type(e), str(e)))
-        return data
-
-    def save_trades(self, begin='last', end=None, pair=None):
-        for market in json.loads(CFG.get('bitfinex', 'live_pairs')) + ["DRK_BTC", "DRK_USD"]:
-            tmpbegin = begin
+    def sync_trades(self, market=None, rescan=False):
+        for market in json.loads(self.cfg.get('bitfinex', 'live_pairs')) + ["DRK_BTC", "DRK_USD"]:
             market = market.replace('DRK', 'DASH')
             allknown = False
+            end = time.time()
             while not allknown:
-                trades = self.get_trades_history(begin=tmpbegin, end=end, pair=market)
+                trades = self.get_trades_history(end=end, market=market)
                 if len(trades) == 0 or 'amount' not in trades[0]:
                     break
                 allknown = True
                 for row in trades:
-                    found = self.session.query(em.Trade)\
-                            .filter(em.Trade.trade_id=='bitfinex|%s' % row['tid'])\
-                            .count()
+                    found = self.session.query(em.Trade) \
+                        .filter(em.Trade.trade_id == 'bitfinex|%s' % row['tid']) \
+                        .count()
                     if found != 0:
                         print "; %s already known" % row['tid']
                         continue
                     allknown = False
-                    if float(row['timestamp']) > tmpbegin:
-                        tmpbegin = float(row['timestamp'])
+                    if float(row['timestamp']) < end:
+                        end = float(row['timestamp'])
                     dtime = datetime.datetime.fromtimestamp(float(row['timestamp']))
                     price = float(row['price'])
                     amount = abs(float(row['amount']))
@@ -334,15 +355,15 @@ class Bitfinex(InternalExchangePlugin):
                     fee_side = 'base' if row['fee_currency'].replace('DRK', 'DASH') == market.split("_")[0] else 'quote'
                     side = row['type'].lower()
                     self.session.add(em.Trade(row['tid'], 'bitfinex', market, side,
-                            amount, price, fee, fee_side, dtime))
+                                              amount, price, fee, fee_side, dtime))
         self.session.commit()
 
-    def save_credits(self, begin='last', end=None):
+    def sync_credits(self, rescan=False):
         for cur in self.active_currencies.union(set(["DRK"])):
-            tmpbegin = begin
             allknown = False
+            end = time.time()
             while not allknown:
-                history = self.get_dw_history(cur, begin=tmpbegin, end=end)
+                history = self.get_dw_history(cur, end=end)
                 if len(history) == 0:
                     break
                 allknown = True
@@ -352,21 +373,21 @@ class Bitfinex(InternalExchangePlugin):
                     rtype = row['type'].lower()
                     found = 0
                     if rtype == "withdrawal":
-                        found = self.session.query(wm.Debit)\
-                                .filter(wm.Debit.ref_id=='bitfinex|%s' % row['id'])\
-                                .count()
+                        found = self.session.query(wm.Debit) \
+                            .filter(wm.Debit.ref_id == 'bitfinex|%s' % row['id']) \
+                            .count()
                     elif rtype == "deposit":
-                        found = self.session.query(wm.Credit)\
-                                .filter(wm.Credit.ref_id=='bitfinex|%s' % row['id'])\
-                                .count()
+                        found = self.session.query(wm.Credit) \
+                            .filter(wm.Credit.ref_id == 'bitfinex|%s' % row['id']) \
+                            .count()
                     if found != 0:
                         print "; %s already known" % row['id']
                         continue
                     allknown = False
-                    if float(row['timestamp']) > tmpbegin:
-                        tmpbegin = float(row['timestamp'])
+                    if float(row['timestamp']) < end:
+                        end = float(row['timestamp'])
                     dtime = datetime.datetime.fromtimestamp(float(row['timestamp']))
-                    asset = unadjust_currency(row['currency']).replace("DRK", "DASH")
+                    asset = self.format_commodity(row['currency'])
                     amount = Amount("%s %s" % (row['amount'], asset))
                     if row['status'] == 'COMPLETED':
                         status = 'complete'
@@ -376,20 +397,22 @@ class Bitfinex(InternalExchangePlugin):
                         status = 'unconfirmed'
                     if rtype == "withdrawal":
                         self.session.add(
-                            wm.Debit(amount, 0, row['description'], asset, "bitfinex", status, "bitfinex", "bitfinex|%s" % row['id'],
-                                     self.get_manager_user().id, dtime))
+                            wm.Debit(amount, 0, row['address'], asset, "bitfinex", status, "bitfinex",
+                                     "bitfinex|%s" % row['id'],
+                                     self.manager_user.id, dtime))
                     elif rtype == "deposit":
-                        self.session.add(wm.Credit(amount, row['description'], asset, "bitfinex", status, "bitfinex", "bitfinex|%s" % row['id'],
-                                         self.get_manager_user().id, dtime))
+                        self.session.add(wm.Credit(amount, row['address'], asset, "bitfinex", status, "bitfinex",
+                                                   "bitfinex|%s" % row['id'],
+                                                   self.manager_user.id, dtime))
                 self.session.commit()
 
-    save_debits = save_credits
+    sync_debits = sync_credits
+
+
+def main():
+    bitfinex = Bitfinex()
+    bitfinex.run()
 
 
 if __name__ == "__main__":
-    bitfinex = Bitfinex()
-    bitfinex.save_trades()
-    bitfinex.save_credits()
-    bitfinex.save_debits()
-    ledger = make_ledger(exchange='bitfinex')
-    print ledger
+    main()
