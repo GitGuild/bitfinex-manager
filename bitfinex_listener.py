@@ -15,7 +15,7 @@ red = setup_redis()
 
 channels = {}
 bitfinex = Bitfinex()
-logger = setup_logging('bitfinex_listener', bitfinex.cfg)
+logger = setup_logging('bitfinex_listener', prefix="trademanager", cfg=bitfinex.cfg)
 bitfinex.setup_connections()
 bitfinex.setup_logger()  # will be actually use the logger above
 
