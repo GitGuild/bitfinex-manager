@@ -8,8 +8,8 @@ classifiers = [
 
 setup(
     name='bitfinex-manager',
-    version='0.0.1',
-    py_modules=['bitfinex_manager'],
+    version='0.0.9',
+    py_modules=['bitfinex_manager', 'bitfinex_listener'],
     url='https://github.com/gitguild/bitfinex-manager',
     license='MIT',
     classifiers=classifiers,
@@ -21,7 +21,12 @@ setup(
         'sqlalchemy>=1.0.9',
         'trade_manager>=0.0.3',
         'tapp-config>=0.0.2',
-        'tappmq', 'requests',
+        'tappmq', 'requests', 'autobahn', 'twisted', 'pyOpenSSL'
     ],
-    tests_require=['pytest', 'pytest-cov']
+    tests_require=['pytest', 'pytest-cov'],
+    entry_points="""
+[console_scripts]
+bitfinexm = bitfinex_manager:main
+bitfinexl = bitfinex_listener:main
+"""
 )

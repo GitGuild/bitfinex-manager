@@ -88,7 +88,6 @@ class TestPluginRunning(unittest.TestCase):
             if corder[0].state != 'closed':
                 time.sleep(0.01)
                 bitfinex.session.close()
-
         assert len(corder) == 1
         assert corder[0].state == 'closed'
 

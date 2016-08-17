@@ -22,6 +22,15 @@ BASE_URL = "https://api.bitfinex.com"
 REQ_TIMEOUT = 10  # seconds
 
 
+def bitfinex_sign(key, secret, msg):
+    signature = hmac.new(secret, msg, sha384).hexdigest()
+    return {
+        'X-BFX-APIKEY': key,
+        'X-BFX-PAYLOAD': msg,
+        'X-BFX-SIGNATURE': signature
+    }
+
+
 class Bitfinex(ExchangePluginBase):
     NAME = 'bitfinex'
     _user = None
@@ -29,12 +38,7 @@ class Bitfinex(ExchangePluginBase):
     def bitfinex_encode(self, msg):
         msg['nonce'] = str(int(time.time() * 1e6))
         msg = b64encode(json.dumps(msg))
-        signature = hmac.new(self.secret, msg, sha384).hexdigest()
-        return {
-            'X-BFX-APIKEY': self.key,
-            'X-BFX-PAYLOAD': msg,
-            'X-BFX-SIGNATURE': signature
-        }
+        return bitfinex_sign(self.key, self.secret, msg)
 
     def bitfinex_request(self, endpoint, params=None):
         if "/v1/" not in endpoint:
@@ -206,7 +210,7 @@ class Bitfinex(ExchangePluginBase):
                 self.session.rollback()
                 self.session.flush()
 
-    def cancel_orders(self, market=None, side=None, oid=None, order_id=None):
+    def cancel_orders(self, oid=None, order_id=None, market=None, side=None, price=None):
         if market is None and side is None and oid is None and order_id is None:
             resp = self.bitfinex_request('order/cancel/all')
             if "orders successfully cancelled" in resp.text:
@@ -227,6 +231,11 @@ class Bitfinex(ExchangePluginBase):
                     continue
                 if side is not None and side != o.side:
                     continue
+                if price is not None:
+                    if o.side == 'bid' and o.price < price:
+                        continue
+                    elif o.side == 'ask' and o.price > price:
+                        continue
                 self.cancel_order(order=o)
 
     def create_order(self, oid, expire=None):
